@@ -121,17 +121,63 @@ jobs:
           fi
 
       # -----------------------------
+      # Verify Terraform Directory
+      # -----------------------------
+      - name: Verify Terraform Files
+        run: |
+          echo "=========================================="
+          echo "Checking Terraform Directory Structure"
+          echo "=========================================="
+          
+          if [ ! -d "terraform" ]; then
+            echo "❌ Error: terraform directory not found!"
+            echo "Repository structure:"
+            ls -la
+            exit 1
+          fi
+          
+          echo "✅ Terraform directory exists"
+          echo ""
+          echo "Terraform files:"
+          ls -la terraform/
+          echo ""
+          
+          # Check for required files
+          REQUIRED_FILES=("main.tf" "variables.tf" "outputs.tf")
+          MISSING_FILES=()
+          
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "terraform/$file" ]; then
+              MISSING_FILES+=("$file")
+            fi
+          done
+          
+          if [ ${#MISSING_FILES[@]} -gt 0 ]; then
+            echo "⚠️  Warning: Missing recommended files: ${MISSING_FILES[*]}"
+          else
+            echo "✅ All recommended Terraform files present"
+          fi
+
+      # -----------------------------
       # Terraform Init
       # -----------------------------
       - name: Terraform Init
         run: |
           cd terraform
+          
+          echo "=========================================="
+          echo "Initializing Terraform"
+          echo "=========================================="
+          
           terraform init -upgrade \
             -backend-config="bucket=$BACKEND_BUCKET" \
             -backend-config="key=$BACKEND_KEY" \
             -backend-config="region=$BACKEND_REGION" \
             -backend-config="dynamodb_table=terraform-state-lock" \
             -backend-config="encrypt=true"
+          
+          echo ""
+          echo "✅ Terraform initialized successfully"
 
       - name: Terraform Format Check
         run: |
@@ -141,29 +187,102 @@ jobs:
       - name: Terraform Validate
         run: |
           cd terraform
+          
+          echo "=========================================="
+          echo "Validating Terraform Configuration"
+          echo "=========================================="
+          
           terraform validate
+          
+          echo ""
+          echo "✅ Terraform configuration is valid"
 
+      # -----------------------------
+      # Terraform Plan (Enhanced)
+      # -----------------------------
       - name: Terraform Plan
         id: plan
         run: |
           cd terraform
+          
+          echo "=========================================="
+          echo "Running Terraform Plan"
+          echo "=========================================="
+          echo "AWS Region: $AWS_REGION"
+          echo "Environment: $ENVIRONMENT"
+          echo "Cluster Name: $CLUSTER_NAME"
+          echo ""
+          
+          # Disable immediate exit on error
+          set +e
+          
+          # Run terraform plan and capture both stdout and stderr
           terraform plan \
             -var="aws_region=$AWS_REGION" \
             -var="environment=$ENVIRONMENT" \
             -var="cluster_name=$CLUSTER_NAME" \
             -out=tfplan \
-            -no-color
-        continue-on-error: true
-
-      - name: Check Plan Status
-        if: steps.plan.outcome == 'failure'
-        run: exit 1
+            -no-color 2>&1 | tee plan_output.log
+          
+          # Capture the exit code
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          
+          # Re-enable exit on error
+          set -e
+          
+          echo ""
+          
+          # Check if plan failed
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            echo "=========================================="
+            echo "❌ TERRAFORM PLAN FAILED"
+            echo "=========================================="
+            echo ""
+            echo "Exit Code: $PLAN_EXIT_CODE"
+            echo ""
+            echo "Full Error Output:"
+            echo "----------------------------------------"
+            cat plan_output.log
+            echo "----------------------------------------"
+            echo ""
+            echo "Terraform Files Present:"
+            ls -la
+            echo ""
+            echo "Debugging Checklist:"
+            echo "1. ✓ Check if all .tf files have correct syntax"
+            echo "2. ✓ Verify required variables are defined in variables.tf"
+            echo "3. ✓ Ensure provider configuration is correct in main.tf"
+            echo "4. ✓ Confirm AWS credentials have necessary permissions"
+            echo "5. ✓ Check if backend configuration is correct"
+            echo ""
+            echo "Common Issues:"
+            echo "- Missing variable definitions"
+            echo "- Invalid HCL syntax"
+            echo "- Missing provider configuration"
+            echo "- Insufficient AWS IAM permissions"
+            echo "- Resource naming conflicts"
+            echo ""
+            exit 1
+          fi
+          
+          echo "✅ Terraform plan completed successfully"
+          echo ""
+          echo "Plan file created: tfplan"
+        continue-on-error: false
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           cd terraform
+          
+          echo "=========================================="
+          echo "Applying Terraform Plan"
+          echo "=========================================="
+          
           terraform apply -auto-approve tfplan
+          
+          echo ""
+          echo "✅ Terraform apply completed successfully"
 
       # -----------------------------
       # Verify ECR and EKS Integration
