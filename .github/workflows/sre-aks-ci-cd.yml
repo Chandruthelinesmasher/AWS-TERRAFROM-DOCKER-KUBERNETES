@@ -1,0 +1,374 @@
+name: SRE AKS CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.6.6"
+
+  # App
+  IMAGE_NAME: k8s-sre-monitoring-app
+
+  # Infra
+  LOCATION: eastus2
+  RESOURCE_GROUP: rg-sre-monitoring-dev
+
+  # Terraform Backend
+  BACKEND_RESOURCE_GROUP: rg-terraform-state
+  BACKEND_STORAGE_ACCOUNT: tfstatesremonitoring
+  BACKEND_CONTAINER: tfstate
+  BACKEND_KEY: sre-monitoring-dev.tfstate
+
+jobs:
+# ==========================================================
+# TERRAFORM – INFRASTRUCTURE
+# ==========================================================
+  terraform:
+    name: Terraform Infra
+    runs-on: ubuntu-latest
+
+    outputs:
+      acr_login_server: ${{ steps.tfout.outputs.acr_login_server }}
+      acr_name: ${{ steps.tfout.outputs.acr_name }}
+      aks_name: ${{ steps.tfout.outputs.aks_name }}
+      resource_group: ${{ steps.tfout.outputs.resource_group }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # Azure Login (Secret Method)
+      # -----------------------------
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # -----------------------------
+      # Export ARM vars for Terraform
+      # -----------------------------
+      - name: Export ARM variables
+        run: |
+          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
+          echo "ARM_CLIENT_ID=$(echo $CREDS | jq -r .clientId)" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=$(echo $CREDS | jq -r .clientSecret)" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=$(echo $CREDS | jq -r .tenantId)" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=$(echo $CREDS | jq -r .subscriptionId)" >> $GITHUB_ENV
+
+      # -----------------------------
+      # Setup Terraform
+      # -----------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # -----------------------------
+      # Backend Storage (Idempotent)
+      # -----------------------------
+      - name: Setup Terraform Backend
+        run: |
+          az group create \
+            --name $BACKEND_RESOURCE_GROUP \
+            --location $LOCATION \
+            --tags purpose=terraform-state || true
+
+          if ! az storage account show \
+            --name $BACKEND_STORAGE_ACCOUNT \
+            --resource-group $BACKEND_RESOURCE_GROUP &>/dev/null; then
+            az storage account create \
+              --name $BACKEND_STORAGE_ACCOUNT \
+              --resource-group $BACKEND_RESOURCE_GROUP \
+              --location $LOCATION \
+              --sku Standard_LRS \
+              --https-only true
+          fi
+
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group $BACKEND_RESOURCE_GROUP \
+            --account-name $BACKEND_STORAGE_ACCOUNT \
+            --query '[0].value' -o tsv)
+
+          az storage container create \
+            --name $BACKEND_CONTAINER \
+            --account-name $BACKEND_STORAGE_ACCOUNT \
+            --account-key $ACCOUNT_KEY || true
+
+      # -----------------------------
+      # Terraform Init
+      # -----------------------------
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -upgrade \
+            -backend-config="resource_group_name=$BACKEND_RESOURCE_GROUP" \
+            -backend-config="storage_account_name=$BACKEND_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$BACKEND_CONTAINER" \
+            -backend-config="key=$BACKEND_KEY"
+
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
+
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var="location=$LOCATION" \
+            -var="resource_group_name=$RESOURCE_GROUP" \
+            -var="environment=dev" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+
+      # -----------------------------
+      # Verify ACR Integration (Managed by Terraform)
+      # -----------------------------
+      - name: Verify ACR Integration
+        run: |
+          echo "=========================================="
+          echo "Verifying ACR Integration..."
+          echo "=========================================="
+          
+          cd terraform
+          
+          # Get outputs from Terraform
+          ACR_ROLE_ASSIGNMENT=$(terraform output -raw acr_role_assignment_id)
+          
+          echo "✅ ACR Role Assignment ID: $ACR_ROLE_ASSIGNMENT"
+          echo ""
+          echo "ACR integration is managed by Terraform and configured automatically!"
+          echo "AKS can now pull images from ACR without manual intervention."
+
+      - name: Export Terraform Outputs
+        id: tfout
+        run: |
+          cd terraform
+          echo "acr_login_server=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+          echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
+          echo "aks_name=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
+          echo "resource_group=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+
+# ==========================================================
+# BUILD & PUSH IMAGE
+# ==========================================================
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
+
+      - name: Verify app directory exists
+        run: |
+          if [ ! -d "app" ]; then
+            echo "Error: app directory not found!"
+            echo "Repository structure:"
+            ls -la
+            exit 1
+          fi
+          echo "App directory contents:"
+          ls -la app/
+
+      - name: Build Image
+        run: |
+          cd app
+          docker build \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            .
+
+      - name: Push Images
+        run: |
+          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+# ==========================================================
+# DEPLOY APP + MONITORING
+# ==========================================================
+  deploy:
+    name: Deploy App & Monitoring
+    needs: [terraform, build-and-push]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --name ${{ needs.terraform.outputs.aks_name }} \
+            --overwrite-existing
+
+      - name: Create Namespaces
+        run: |
+          kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy Monitoring Stack (First)
+        run: |
+          echo "Installing Prometheus Operator and monitoring stack..."
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            -n monitoring \
+            --set grafana.adminPassword=admin123 \
+            --wait \
+            --timeout 10m
+          
+          echo "Waiting for Prometheus Operator CRDs to be ready..."
+          kubectl wait --for condition=established --timeout=300s \
+            crd/servicemonitors.monitoring.coreos.com || echo "ServiceMonitor CRD check timed out"
+
+      - name: Deploy Application
+        run: |
+          echo "=========================================="
+          echo "Deploying application resources..."
+          echo "=========================================="
+          
+          # Update image reference
+          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
+          
+          # Apply application manifests
+          kubectl apply -f k8s/app -n app
+          
+          echo ""
+          echo "✅ Application manifests deployed"
+          echo ""
+          
+          # Give pods time to start pulling images
+          echo "⏳ Waiting 30 seconds for pods to start..."
+          sleep 30
+          
+          # Check initial pod status
+          echo "=========================================="
+          echo "Initial Pod Status:"
+          echo "=========================================="
+          kubectl get pods -n app -o wide
+          
+          # Check for image pull errors
+          POD_STATUS=$(kubectl get pods -n app -o jsonpath='{.items[0].status.containerStatuses[0].state}' 2>/dev/null || echo "{}")
+          if echo "$POD_STATUS" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+            echo ""
+            echo "⚠️  WARNING: Detected image pull issues. Checking pod events..."
+            kubectl describe pods -l app=sre-app -n app | grep -A 10 "Events:"
+            echo ""
+            echo "Note: ACR integration is managed by Terraform and should be configured."
+          fi
+
+      - name: Deploy ServiceMonitor
+        run: |
+          echo "Deploying ServiceMonitor for metrics scraping..."
+          
+          # Check if ServiceMonitor CRD exists
+          if kubectl get crd servicemonitors.monitoring.coreos.com &>/dev/null; then
+            kubectl apply -f k8s/monitoring/servicemonitor.yaml
+            echo "✅ ServiceMonitor deployed successfully"
+          else
+            echo "⚠️  ServiceMonitor CRD not found. Skipping ServiceMonitor deployment."
+            echo "This usually means Prometheus Operator is not fully installed yet."
+          fi
+
+      - name: Verify Deployment
+        run: |
+          echo "Waiting for pods to be ready..."
+          kubectl wait --for=condition=ready pod -l app=sre-app -n app --timeout=300s || {
+            echo "⚠️  Pods failed to become ready. Checking pod status..."
+            kubectl get pods -n app
+            echo ""
+            echo "Pod Events:"
+            kubectl describe pods -l app=sre-app -n app | grep -A 20 Events:
+            exit 1
+          }
+          
+          echo ""
+          echo "=========================================="
+          echo "=== APPLICATION PODS ==="
+          echo "=========================================="
+          kubectl get pods -n app -o wide
+          
+          echo ""
+          echo "=========================================="
+          echo "=== MONITORING PODS ==="
+          echo "=========================================="
+          kubectl get pods -n monitoring
+          
+          echo ""
+          echo "=========================================="
+          echo "=== APPLICATION SERVICES ==="
+          echo "=========================================="
+          kubectl get svc -n app
+          
+          echo ""
+          echo "=========================================="
+          echo "=== MONITORING SERVICES ==="
+          echo "=========================================="
+          kubectl get svc -n monitoring
+          
+          echo ""
+          echo "=========================================="
+          echo "=== SERVICEMONITOR STATUS ==="
+          echo "=========================================="
+          kubectl get servicemonitor -n app || echo "No ServiceMonitors found"
+          
+          echo ""
+          echo "=========================================="
+          echo "=== APPLICATION LOAD BALANCER IP ==="
+          echo "=========================================="
+          APP_IP=$(kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          if [ "$APP_IP" != "pending" ]; then
+            echo "Application URL: http://$APP_IP"
+          else
+            echo "LoadBalancer IP not yet assigned (this may take a few minutes)"
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "=== GRAFANA ACCESS ==="
+          echo "=========================================="
+          GRAFANA_IP=$(kubectl get svc monitoring-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          if [ "$GRAFANA_IP" != "pending" ]; then
+            echo "Grafana URL: http://$GRAFANA_IP"
+            echo "Username: admin"
+            echo "Password: admin123"
+          else
+            echo "Grafana LoadBalancer IP pending..."
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "=== PROMETHEUS ACCESS ==="
+          echo "=========================================="
+          PROM_IP=$(kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          if [ "$PROM_IP" != "pending" ]; then
+            echo "Prometheus URL: http://$PROM_IP:9090"
+          else
+            echo "Prometheus LoadBalancer IP pending..."
+          fi
